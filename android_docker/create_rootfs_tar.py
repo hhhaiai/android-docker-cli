@@ -933,9 +933,9 @@ class DockerImageToRootFS:
 
         # 构建基础命令
         if magic == b'\x1f\x8b':  # gzip
-            base_cmd = ['tar', '-xzf', layer_path, '-C', rootfs_dir]
+            base_cmd = ['proot','-0','-l','tar', '-xzf', layer_path, '-C', rootfs_dir]
         else:
-            base_cmd = ['tar', '-xf', layer_path, '-C', rootfs_dir]
+            base_cmd = ['proot','-0','-l','tar', '-xf', layer_path, '-C', rootfs_dir]
 
         # 根据是否为第一层和环境选择不同的选项
         if self._is_android_environment():
@@ -953,7 +953,6 @@ class DockerImageToRootFS:
                     '--no-same-permissions',
                     '--dereference',
                     '--overwrite',
-                    '--skip-old-files'  # 跳过已存在的文件而不是报错
                 ]
         else:
             # 标准Linux环境选项
