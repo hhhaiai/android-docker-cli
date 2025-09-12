@@ -295,6 +295,7 @@ class DockerCLI:
             '--rootfs-dir', rootfs_dir,
             '--pid-file', pid_file,
             '--log-file', log_file,
+            '--cache-dir', self.cache_dir,  # 传递统一的缓存目录
             '--detach',
         ]
         
