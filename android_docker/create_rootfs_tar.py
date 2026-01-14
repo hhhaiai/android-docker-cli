@@ -785,23 +785,30 @@ class DockerImageToRootFS:
 
     def _extract_layer(self, layer_path, rootfs_dir, is_first_layer=False):
         """提取单个层到根文件系统目录"""
-        # 在Android环境中优先使用tar命令，因为它对硬链接处理更好
+        # 在Android环境中优先使用Python tarfile，因为它能更好地处理硬链接
         if self._is_android_environment():
             try:
-                self._extract_layer_with_tar(layer_path, rootfs_dir, is_first_layer)
+                logger.debug("Android环境：使用Python tarfile模块提取")
+                self._extract_layer_with_python(layer_path, rootfs_dir)
                 return
             except Exception as e:
-                logger.warning(f"tar命令提取失败: {e}")
-                logger.info("尝试使用Python tarfile模块...")
+                logger.warning(f"Python tarfile提取失败: {e}")
+                logger.info("尝试使用tar命令...")
+                try:
+                    self._extract_layer_with_tar(layer_path, rootfs_dir, is_first_layer)
+                    return
+                except Exception as e2:
+                    logger.error(f"tar命令也失败: {e2}")
+                    raise
 
+        # 非Android环境：优先使用tar命令
         try:
-            # 使用Python的tarfile模块
-            self._extract_layer_with_python(layer_path, rootfs_dir)
+            self._extract_layer_with_tar(layer_path, rootfs_dir, is_first_layer)
+            return
         except Exception as e:
-            logger.warning(f"Python tarfile提取失败: {e}")
-            # 如果还没试过tar命令，现在试试
-            if not self._is_android_environment():
-                self._extract_layer_with_tar(layer_path, rootfs_dir, is_first_layer)
+            logger.warning(f"tar命令提取失败: {e}")
+            logger.info("尝试使用Python tarfile模块...")
+            self._extract_layer_with_python(layer_path, rootfs_dir)
 
     def _extract_layer_with_python(self, layer_path, rootfs_dir):
         """使用Python tarfile模块提取层"""
