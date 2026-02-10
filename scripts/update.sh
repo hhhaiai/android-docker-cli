@@ -12,7 +12,6 @@ set -e
 
 OWNER_REPO="jinhan1414/android-docker-cli"
 API_URL="https://api.github.com/repos/${OWNER_REPO}/releases/latest"
-INSTALL_URL="https://raw.githubusercontent.com/${OWNER_REPO}/main/scripts/install.sh"
 
 echo "[INFO] Checking latest release for ${OWNER_REPO}..."
 TAG="$(curl -fsSL "${API_URL}" | python -c "import sys, json; print(json.load(sys.stdin)['tag_name'])")"
@@ -23,5 +22,4 @@ if [ -z "${TAG}" ]; then
 fi
 
 echo "[INFO] Updating to ${TAG}..."
-INSTALL_VERSION="${TAG}" curl -fsSL "${INSTALL_URL}" | sh
-
+curl -fsSL "https://raw.githubusercontent.com/${OWNER_REPO}/${TAG}/scripts/install.sh" | sh
