@@ -601,6 +601,7 @@ class ProotRunner:
             'var/log',
             'var/cache',
             'var/tmp',
+            'var/run',
             'tmp',
             'run',
         ]

@@ -66,7 +66,7 @@ class TestWritableDirectories(unittest.TestCase):
         if os.path.exists(self.test_dir):
             shutil.rmtree(self.test_dir)
     
-    @given(st.lists(st.sampled_from(['var/log', 'var/cache', 'var/tmp', 'tmp', 'run']), 
+    @given(st.lists(st.sampled_from(['var/log', 'var/cache', 'var/tmp', 'var/run', 'tmp', 'run']), 
                     min_size=1, max_size=5, unique=True))
     @settings(max_examples=50)
     def test_writable_directory_creation(self, dir_list):
