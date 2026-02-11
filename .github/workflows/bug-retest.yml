@@ -167,6 +167,7 @@ jobs:
 
       - name: Run deploy-path issue retest
         if: ${{ inputs.scope == 'deploy-repro' }}
+        timeout-minutes: 8
         shell: bash
         run: |
           set -euo pipefail
