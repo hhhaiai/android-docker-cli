@@ -117,7 +117,7 @@ jobs:
           mkdir -p "$PREFIX/bin"
           echo "$PREFIX/bin" >> "$GITHUB_PATH"
 
-          INSTALL_VERSION="${{ inputs.target_ref }}" \
+          export INSTALL_VERSION="${{ inputs.target_ref }}"
           curl -fsSL "https://raw.githubusercontent.com/jinhan1414/android-docker-cli/main/scripts/install.sh" | sh
 
           command -v docker
