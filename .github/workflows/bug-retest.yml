@@ -200,7 +200,6 @@ jobs:
           IMAGE="registry.cn-hangzhou.aliyuncs.com/hass-panel/hass-panel:latest"
           WORK_DIR="$PWD/.repro-issue4"
           COMPOSE_FILE="$WORK_DIR/docker-compose.yml"
-          LOG_FILE="$WORK_DIR/repro.log"
           mkdir -p "$WORK_DIR/data"
           printf "%s\n" \
             "version: '3'" \
@@ -219,23 +218,58 @@ jobs:
           export ANDROID_DOCKER_FAKE_ROOT=${{ inputs.fake_root }}
           export ANDROID_DOCKER_LINK2SYMLINK=0
 
+          SERVICE_CONTAINER="hass-panel"
+          UP_LOG="$WORK_DIR/up.log"
+          CONTAINER_LOG="$WORK_DIR/container.log"
+          DOWN_LOG="$WORK_DIR/down.log"
+          LOG_WAIT_SECONDS=90
+
           set +e
           if command -v timeout >/dev/null 2>&1; then
             timeout --kill-after=20s "${REPRO_TIMEOUT_SECONDS}s" \
-              docker-compose -f "$COMPOSE_FILE" up >"$LOG_FILE" 2>&1
+              docker-compose -f "$COMPOSE_FILE" up -d >"$UP_LOG" 2>&1
           else
-            docker-compose -f "$COMPOSE_FILE" up >"$LOG_FILE" 2>&1
+            docker-compose -f "$COMPOSE_FILE" up -d >"$UP_LOG" 2>&1
           fi
-          cmd_code=$?
+          up_code=$?
+
+          logs_code=127
+          end_time=$((SECONDS + LOG_WAIT_SECONDS))
+          while [ "${SECONDS}" -lt "${end_time}" ]; do
+            docker logs "$SERVICE_CONTAINER" >"$CONTAINER_LOG" 2>&1
+            logs_code=$?
+            if [ "${logs_code}" -eq 0 ]; then
+              break
+            fi
+            sleep 2
+          done
+
+          if command -v timeout >/dev/null 2>&1; then
+            timeout --kill-after=10s 60s docker-compose -f "$COMPOSE_FILE" down >"$DOWN_LOG" 2>&1
+          else
+            docker-compose -f "$COMPOSE_FILE" down >"$DOWN_LOG" 2>&1
+          fi
+          down_code=$?
           set -e
 
-          tail -n 120 "$LOG_FILE" > artifacts/deploy-repro.stdout.log || true
-          if grep -q "proot error: '/bin/bash' is not executable" "$LOG_FILE"; then
+          {
+            echo "---- docker-compose up -d (tail -n 120) ----"
+            tail -n 120 "$UP_LOG" 2>/dev/null || true
+            echo "---- docker logs ${SERVICE_CONTAINER} (tail -n 120) ----"
+            tail -n 120 "$CONTAINER_LOG" 2>/dev/null || true
+            echo "---- docker-compose down (tail -n 120) ----"
+            tail -n 120 "$DOWN_LOG" 2>/dev/null || true
+            echo "up exit code: ${up_code}"
+            echo "logs exit code: ${logs_code}"
+            echo "down exit code: ${down_code}"
+          } > artifacts/deploy-repro.stdout.log
+
+          if grep -q "proot error: '/bin/bash' is not executable" "$UP_LOG" || \
+             grep -q "proot error: '/bin/bash' is not executable" "$CONTAINER_LOG"; then
             code=0
           else
             code=2
           fi
-          echo "docker-compose exit code: ${cmd_code}" >> artifacts/deploy-repro.stdout.log
 
           expected="${{ inputs.deploy_expect }}"
           echo "deploy script exit code: ${code}, expected: ${expected}"
@@ -259,8 +293,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [ -f .repro-issue4/repro.log ]; then
-            cp .repro-issue4/repro.log artifacts/deploy-repro.log
+          if [ -f .repro-issue4/up.log ]; then
+            cp .repro-issue4/up.log artifacts/deploy-repro-up.log
+          fi
+          if [ -f .repro-issue4/container.log ]; then
+            cp .repro-issue4/container.log artifacts/deploy-repro-container.log
+          fi
+          if [ -f .repro-issue4/down.log ]; then
+            cp .repro-issue4/down.log artifacts/deploy-repro-down.log
           fi
 
       - name: Upload retest artifacts

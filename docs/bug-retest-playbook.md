@@ -33,6 +33,7 @@ This document defines the default mechanism to reproduce and verify Android/Term
     - `fixed` after patch
   - `fake_root`: usually `1`
 - For `deploy-repro`, CI must execute the README installation path first (installer command), then run installed `docker`/`docker-compose` commands for replay.
+- For `deploy-repro`, run `docker-compose up -d`, collect container logs for signature checks, then always run `docker-compose down` for cleanup.
 
 4. Implement fix
 - Keep fix minimal and scoped to the failing behavior.
