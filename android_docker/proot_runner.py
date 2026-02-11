@@ -615,9 +615,16 @@ class ProotRunner:
 
         bind_mounts = []
 
+        # Many distros treat /var/run as a symlink to /run. Ensure they share the same host dir
+        # so software (e.g. supervisord) doesn't see inconsistent runtime state.
+        shared_run_host_dir = os.path.join(writable_storage, 'run')
+
         for dir_path in writable_dirs:
             # 创建主机侧的可写目录
-            host_dir = os.path.join(writable_storage, dir_path.replace('/', '_'))
+            if dir_path in ('run', 'var/run'):
+                host_dir = shared_run_host_dir
+            else:
+                host_dir = os.path.join(writable_storage, dir_path.replace('/', '_'))
             os.makedirs(host_dir, exist_ok=True)
 
             # 设置权限
@@ -625,6 +632,17 @@ class ProotRunner:
                 os.chmod(host_dir, 0o777)  # 完全可写
             except OSError:
                 pass
+
+            # Best-effort cleanup for known stale supervisor artifacts. These are transient and can
+            # block startup if persisted across runs in host-side writable dirs.
+            if host_dir == shared_run_host_dir:
+                for stale_name in ('supervisor.sock', 'supervisord.pid', 'supervisord.sock'):
+                    stale_path = os.path.join(host_dir, stale_name)
+                    try:
+                        if os.path.exists(stale_path):
+                            os.remove(stale_path)
+                    except OSError:
+                        pass
 
             self._seed_writable_directory_structure(rootfs_dir, dir_path, host_dir)
 

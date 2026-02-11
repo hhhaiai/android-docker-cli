@@ -119,6 +119,22 @@ class TestWritableDirectories(unittest.TestCase):
         finally:
             self.runner._is_android_environment = original_method
 
+    def test_run_and_var_run_share_host_dir(self):
+        rootfs_dir = os.path.join(self.test_dir, 'rootfs')
+        os.makedirs(os.path.join(rootfs_dir, 'bin'), exist_ok=True)
+        Path(os.path.join(rootfs_dir, 'bin', 'sh')).touch()
+
+        original_method = self.runner._is_android_environment
+        self.runner._is_android_environment = lambda: True
+
+        try:
+            binds = self.runner._prepare_writable_directories(rootfs_dir)
+            run_bind = next(b for b in binds if b.endswith(':/run'))
+            var_run_bind = next(b for b in binds if b.endswith(':/var/run'))
+            self.assertEqual(run_bind.split(':', 1)[0], var_run_bind.split(':', 1)[0])
+        finally:
+            self.runner._is_android_environment = original_method
+
 
 class TestAndroidHostsBind(unittest.TestCase):
     """测试Android hosts绑定"""
