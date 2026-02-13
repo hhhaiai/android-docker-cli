@@ -384,6 +384,63 @@ class TestAndroidLink2SymlinkMode(unittest.TestCase):
         self.assertNotIn('--link2symlink', cmd, "Escape hatch should disable --link2symlink when set to 0")
 
 
+class TestNoShellEntrypointFallback(unittest.TestCase):
+    """无shell镜像应直接执行Entrypoint，并保留用户环境变量注入。"""
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp(prefix='test_noshell_entrypoint_')
+        self.runner = ProotRunner(cache_dir=self.test_dir)
+        self.rootfs_dir = os.path.join(self.test_dir, 'rootfs')
+        os.makedirs(os.path.join(self.rootfs_dir, 'app'), exist_ok=True)
+        Path(os.path.join(self.rootfs_dir, 'app', 'server')).touch()
+        self.runner.rootfs_dir = self.rootfs_dir
+        self.runner.config_data = {
+            "config": {
+                "Entrypoint": ["/app/server"],
+                "WorkingDir": "/app",
+            }
+        }
+        self._orig_android = self.runner._is_android_environment
+        self.runner._is_android_environment = lambda: True
+
+        class Args:
+            detach = False
+            bind = []
+            workdir = None
+            env = [
+                "CERBER_API_KEY=test-key",
+                "CERBER_BASE_URL=https://api.cerber.ai",
+                "CERBER_MODEL=gpt-4o-mini",
+            ]
+            command = []
+            fake_root = None
+
+        self.Args = Args
+
+    def tearDown(self):
+        self.runner._is_android_environment = self._orig_android
+        if os.path.exists(self.test_dir):
+            shutil.rmtree(self.test_dir)
+
+    def test_build_proot_command_uses_direct_entrypoint_when_shell_missing(self):
+        cmd = self.runner._build_proot_command(self.Args())
+        self.assertIn('/app/server', cmd)
+        self.assertNotIn('/startup.sh', cmd)
+        self.assertEqual(self.runner._container_env_overrides.get('CERBER_API_KEY'), 'test-key')
+        self.assertEqual(self.runner._container_env_overrides.get('CERBER_BASE_URL'), 'https://api.cerber.ai')
+        self.assertEqual(self.runner._container_env_overrides.get('CERBER_MODEL'), 'gpt-4o-mini')
+
+    def test_prepare_environment_injects_overrides_without_clobbering_path(self):
+        self.runner._container_env_overrides = {}
+        baseline_env = self.runner._prepare_environment()
+        self.runner._build_proot_command(self.Args())
+        env = self.runner._prepare_environment()
+        self.assertEqual(env.get('CERBER_API_KEY'), 'test-key')
+        self.assertEqual(env.get('CERBER_BASE_URL'), 'https://api.cerber.ai')
+        self.assertEqual(env.get('CERBER_MODEL'), 'gpt-4o-mini')
+        self.assertEqual(env.get('PATH'), baseline_env.get('PATH'))
+
+
 class TestCriticalFileValidation(unittest.TestCase):
     """测试关键文件验证"""
     

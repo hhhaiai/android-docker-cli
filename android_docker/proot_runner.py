@@ -38,6 +38,8 @@ class ProotRunner:
         self.temp_dir = None
         self.rootfs_dir = None
         self.config_data = None
+        # Best-effort env overrides passed to host exec when shell-based startup script is unavailable.
+        self._container_env_overrides = {}
         self.cache_dir = cache_dir or self._get_default_cache_dir()
         self._ensure_cache_dir()
 
@@ -346,8 +348,8 @@ class ProotRunner:
             logger.debug("使用busybox shell执行脚本")
             return '/bin/busybox'
 
-        logger.warning("未找到可用的shell执行脚本，使用默认/bin/sh")
-        return '/bin/sh'  # 最后的备选
+        logger.warning("未找到可用的shell执行脚本")
+        return None
 
     def _get_default_env(self):
         """获取默认环境变量"""
@@ -382,6 +384,7 @@ class ProotRunner:
     def _build_proot_command(self, args):
         """构建proot命令（增强Android支持）"""
         cmd = ['proot']
+        self._container_env_overrides = {}
 
         # Android/Termux compatibility flags.
         cmd.extend(self._get_proot_compat_flags(args))
@@ -464,13 +467,23 @@ class ProotRunner:
         if env_vars or self._is_android_environment():
             # 获取可用的shell来执行启动脚本
             available_shell = self._get_available_shell()
-            startup_script = self._create_startup_script(env_vars, final_command)
+            if available_shell:
+                startup_script = self._create_startup_script(env_vars, final_command, available_shell=available_shell)
 
-            # 如果是busybox，需要添加sh参数
-            if available_shell == '/bin/busybox':
-                cmd.extend([available_shell, 'sh', startup_script])
+                # 如果是busybox，需要添加sh参数
+                if available_shell == '/bin/busybox':
+                    cmd.extend([available_shell, 'sh', startup_script])
+                else:
+                    cmd.extend([available_shell, startup_script])
             else:
-                cmd.extend([available_shell, startup_script])
+                # Distroless/no-shell images still need to run their entrypoint directly.
+                # We cannot inject env via startup script in this mode, so pass a host-safe subset
+                # through subprocess env. Avoid PATH override to keep host-side proot lookup stable.
+                self._container_env_overrides = {
+                    key: value for key, value in env_vars.items() if key != 'PATH'
+                }
+                logger.warning("镜像内无可用shell，改为直接执行入口命令并通过宿主环境注入变量")
+                cmd.extend(final_command)
         else:
             cmd.extend(final_command)
 
@@ -580,10 +593,13 @@ class ProotRunner:
 
         return flags
 
-    def _create_startup_script(self, env_vars, command):
+    def _create_startup_script(self, env_vars, command, available_shell=None):
         """创建启动脚本来设置环境变量和执行命令"""
         # 获取可用的shell来作为脚本的shebang
-        available_shell = self._get_available_shell()
+        if available_shell is None:
+            available_shell = self._get_available_shell()
+        if not available_shell:
+            raise RuntimeError("无法创建启动脚本：镜像中没有可用shell")
 
         # 如果是busybox，需要特殊处理
         if available_shell == '/bin/busybox':
@@ -802,6 +818,10 @@ class ProotRunner:
 
             env['PATH'] = ':'.join(safe_paths)
             logger.debug(f"调整后的PATH: {env['PATH']}")
+
+        # Inject container env overrides when script-based env export is unavailable.
+        for key, value in (self._container_env_overrides or {}).items():
+            env[key] = value
 
         return env
 
