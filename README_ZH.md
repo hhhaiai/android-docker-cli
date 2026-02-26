@@ -19,11 +19,11 @@
 # 安装最新版本（main分支）
 curl -sSL https://raw.githubusercontent.com/jinhan1414/android-docker-cli/main/scripts/install.sh | sh
 
-# 安装特定版本（例如 v1.1.0）
-curl -sSL https://raw.githubusercontent.com/jinhan1414/android-docker-cli/v1.1.0/scripts/install.sh | sh
+# 安装特定版本（例如 v1.2.15）
+curl -sSL https://raw.githubusercontent.com/jinhan1414/android-docker-cli/v1.2.15/scripts/install.sh | sh
 
 # 或使用环境变量指定版本
-INSTALL_VERSION=v1.2.0 curl -sSL https://raw.githubusercontent.com/jinhan1414/android-docker-cli/main/scripts/install.sh | sh
+INSTALL_VERSION=v1.2.15 curl -sSL https://raw.githubusercontent.com/jinhan1414/android-docker-cli/main/scripts/install.sh | sh
 ```
 
 这将会创建一个名为 `docker` 的可执行命令到您的系统路径中。安装后，您只需输入 `docker` 即可运行此工具。
@@ -66,6 +66,12 @@ docker run -it alpine:latest /bin/sh
 # 此示例使用 `examples/nginx.conf` 文件, 它将监听 8777 端口。
 docker run -d --name my-nginx -v $(pwd)/examples/nginx.conf:/etc/nginx/nginx.conf nginx:alpine
 
+# 容器退出后自动删除
+docker run --rm alpine:latest sh -c "echo done"
+
+# 使用 env 文件 / entrypoint / user
+docker run --env-file .env --entrypoint /bin/sh --user 0 alpine:latest -c "env | head"
+
 # 列出正在运行的容器
 docker ps
 
@@ -75,9 +81,12 @@ docker ps -a
 # 查看容器日志
 docker logs <container_id>
 docker logs -f <container_id>  # 持续跟踪日志
+docker logs --tail 20 <container_id>
+docker logs --since 1m <container_id>
 
 # 停止一个容器
 docker stop <container_id>
+docker stop -t 1 <container_id>
 
 # 启动一个已停止的容器
 docker start <container_id>
@@ -87,6 +96,7 @@ docker restart <container_id>
 
 # 删除一个容器
 docker rm <container_id>
+docker rm -f -v <container_id_1> <container_id_2>
 
 # 附加到运行中的容器
 docker attach <container_id>
@@ -94,9 +104,12 @@ docker attach <container_id>
 # 在运行中的容器中执行命令
 docker exec <container_id> ls -l
 docker exec -it <container_id> /bin/sh
+docker exec -e A=1 --user 0 <container_id> sh -c "echo \$A"
 
 # 列出缓存的镜像
 docker images
+docker images --digests
+docker images --format "{{.Repository}}:{{.Tag}} {{.Digest}}"
 
 # 从本地tar文件加载镜像
 docker load -i alpine.tar
@@ -151,17 +164,20 @@ docker load -i alpine.tar
 
 ## Docker Compose 支持
 
-此工具包含一个 `docker-compose` 命令，用于管理多容器应用。
+此工具同时支持 `docker compose` 与 `docker-compose`，用于管理多容器应用。
 
 ```bash
 # 启动 docker-compose.yml 中定义的服务
-docker-compose up
+docker compose up
 
 # 在后台运行
-docker-compose up -d
+docker compose -f docker-compose.yml up -d
 
 # 停止并移除服务
-docker-compose down
+docker compose down
+
+# 兼容旧命令
+docker-compose up -d
 ```
 
 ### `docker-compose.yml` 示例
@@ -183,10 +199,36 @@ services:
 - ✅ **镜像仓库认证**: 使用 `login` 命令登录私有或公共镜像仓库。
 - ✅ **本地镜像加载**: 使用 `docker load` 从本地tar文件加载Docker镜像。
 - ✅ **OCI镜像仓库支持**: 从符合OCI标准的镜像仓库（如GitHub Container Registry (ghcr.io)）拉取镜像。
-- ✅ **Docker Compose 支持**: 使用 `docker-compose up` 和 `down` 管理多容器配置。
+- ✅ **Docker Compose 支持**: 使用 `docker compose` 与 `docker-compose` 管理多容器配置。
 - ✅ **Docker风格CLI**: 熟悉且直观的命令行界面。
 - ✅ **持久化存储**: 容器在重启后能保持其状态和文件系统，存储于 `~/.docker_proot_cache/`。
 - ✅ **Android优化**: 针对 Termux 环境进行了特别优化。
+
+## 参数兼容说明（v1.2.15）
+
+常见可用参数组合：
+- `docker run --rm`
+- `docker run --env-file`
+- `docker run --entrypoint`
+- `docker run --user`（部分支持）
+- `docker run --add-host`、`docker run --dns`（Android 路径支持）
+- `docker ps -q`、`docker ps --format`
+- `docker logs --tail`、`docker logs --since`
+- `docker exec -e`、`docker exec --user`（部分支持）
+- `docker images --digests`、`docker images --format`
+- `docker pull --platform`（接受参数并明确提示“平台被忽略”）
+- `docker stop -t`
+- `docker rm -v`
+- `docker rm` 多容器参数
+
+明确不支持的 `run` 参数（会显式报错）：
+- `-p`、`--publish`
+- `--network`
+- `--restart`
+- `--privileged`
+
+完整归档兼容矩阵：
+- `docs/docker-parameter-compat-matrix-2026-02-26.md`
 
 ## 故障排除
 

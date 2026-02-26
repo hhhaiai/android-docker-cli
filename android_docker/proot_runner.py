@@ -416,10 +416,16 @@ class ProotRunner:
             if self.rootfs_dir:
                 writable_binds = self._prepare_writable_directories(self.rootfs_dir)
                 default_binds.extend(writable_binds)
-                hosts_bind = self._prepare_android_hosts_bind(self.rootfs_dir)
+                hosts_bind = self._prepare_android_hosts_bind(
+                    self.rootfs_dir,
+                    extra_hosts=getattr(args, 'add_host', []),
+                )
                 if hosts_bind:
                     default_binds.append(hosts_bind)
-                resolv_bind = self._prepare_android_resolv_bind(self.rootfs_dir)
+                resolv_bind = self._prepare_android_resolv_bind(
+                    self.rootfs_dir,
+                    dns_servers=getattr(args, 'dns', []),
+                )
                 if resolv_bind:
                     default_binds.append(resolv_bind)
                 logger.info("已启用Android可写目录支持")
@@ -454,17 +460,29 @@ class ProotRunner:
         if args.detach:
             env_vars['TERM'] = 'dumb'
 
+        if getattr(args, 'user', None):
+            user_value = str(args.user)
+            if user_value not in {'0', '0:0', 'root'}:
+                logger.warning(f"--user={user_value} 当前在proot模式仅部分支持，继续以当前用户执行。")
+            env_vars.setdefault('USER', user_value.split(':', 1)[0])
+
         # proot不支持-E选项，需要通过其他方式设置环境变量
         # 我们将通过修改启动命令来设置环境变量
 
         # 构建最终的执行命令
+        default_cmd = self._get_default_command()
         if args.command:
             final_command = args.command
             logger.info(f"使用用户指定的命令: {final_command}")
         else:
-            default_cmd = self._get_default_command()
             final_command = default_cmd
             logger.debug(f"使用默认命令: {final_command}")
+
+        if getattr(args, 'entrypoint', None):
+            entrypoint_parts = shlex.split(args.entrypoint)
+            cmd_tail = final_command if args.command else default_cmd
+            final_command = entrypoint_parts + cmd_tail
+            logger.info(f"使用覆盖入口点: {entrypoint_parts}")
 
         # 创建启动脚本来设置环境变量
         if env_vars or self._is_android_environment():
@@ -744,7 +762,7 @@ class ProotRunner:
         logger.info(f"已准备 {len(bind_mounts)} 个可写系统目录")
         return bind_mounts
 
-    def _prepare_android_hosts_bind(self, rootfs_dir):
+    def _prepare_android_hosts_bind(self, rootfs_dir, extra_hosts=None):
         """Create a host-side /etc/hosts file for Android and return its bind spec."""
         if not rootfs_dir:
             return None
@@ -783,6 +801,23 @@ class ProotRunner:
             lines.append('127.0.0.1 localhost')
         if not has_localhost('::1'):
             lines.append('::1 localhost')
+
+        for host_entry in extra_hosts or []:
+            if ':' not in host_entry:
+                logger.warning(f"忽略无效 --add-host 参数: {host_entry}")
+                continue
+            host, ip = host_entry.split(':', 1)
+            host = host.strip()
+            ip = ip.strip()
+            if not host or not ip:
+                logger.warning(f"忽略无效 --add-host 参数: {host_entry}")
+                continue
+            try:
+                ipaddress.ip_address(ip)
+            except ValueError:
+                logger.warning(f"忽略无效IP的 --add-host 参数: {host_entry}")
+                continue
+            lines.append(f'{ip} {host}')
 
         try:
             with open(host_hosts_path, 'w', encoding='utf-8') as handle:
@@ -857,7 +892,7 @@ class ProotRunner:
 
         return values
 
-    def _prepare_android_resolv_bind(self, rootfs_dir):
+    def _prepare_android_resolv_bind(self, rootfs_dir, dns_servers=None):
         """Create Android /etc/resolv.conf bind.
 
         Default behavior: pin DNS to 1.1.1.1 for stability.
@@ -871,7 +906,8 @@ class ProotRunner:
         os.makedirs(writable_storage, exist_ok=True)
 
         host_resolv_path = os.path.join(writable_storage, 'etc_resolv.conf')
-        dns_servers = []
+        requested_dns = list(dns_servers or [])
+        resolved_dns = []
 
         def add_servers(candidates):
             for candidate in candidates:
@@ -880,18 +916,19 @@ class ProotRunner:
                     continue
                 if self._is_localhost_dns_server(value):
                     continue
-                if value in dns_servers:
+                if value in resolved_dns:
                     continue
-                dns_servers.append(value)
+                resolved_dns.append(value)
 
         env_dns = os.environ.get('ANDROID_DOCKER_DNS', '')
+        add_servers(requested_dns)
         if env_dns:
             add_servers(env_dns.replace(',', ' ').split())
-        if not dns_servers:
-            dns_servers = ['1.1.1.1']
+        if not resolved_dns:
+            resolved_dns = ['1.1.1.1']
             logger.info("Android DNS固定为 1.1.1.1（可通过 ANDROID_DOCKER_DNS 覆盖）")
 
-        lines = [f'nameserver {server}' for server in dns_servers]
+        lines = [f'nameserver {server}' for server in resolved_dns]
 
         try:
             with open(host_resolv_path, 'w', encoding='utf-8') as handle:
@@ -1311,6 +1348,30 @@ def main():
     parser.add_argument(
         '-w', '--workdir',
         help='工作目录'
+    )
+
+    parser.add_argument(
+        '--entrypoint',
+        help='覆盖镜像入口点'
+    )
+
+    parser.add_argument(
+        '--user',
+        help='运行用户（当前为部分支持）'
+    )
+
+    parser.add_argument(
+        '--add-host',
+        action='append',
+        default=[],
+        help='额外hosts映射 HOST:IP'
+    )
+
+    parser.add_argument(
+        '--dns',
+        action='append',
+        default=[],
+        help='额外DNS服务器'
     )
     
     parser.add_argument(

@@ -13,7 +13,7 @@ import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-def run_docker_cli_command(command, args, cache_dir=None, detach=False):
+def run_docker_cli_command(command, args, cache_dir=None):
     # 直接通过模块化方式调用 docker_cli
     base_cmd = [sys.executable, '-m', 'android_docker.docker_cli']
     if cache_dir:
@@ -21,12 +21,8 @@ def run_docker_cli_command(command, args, cache_dir=None, detach=False):
     cmd = base_cmd + [command] + args
     logger.info(f"Executing: {' '.join(cmd)}")
     try:
-        if detach:
-            # 使用 Popen 启动后台进程，不等待其完成
-            subprocess.Popen(cmd)
-        else:
-            # 使用 run 等待前台进程完成
-            subprocess.run(cmd, check=True)
+        # 使用 run 等待命令退出，确保不会“假成功”
+        subprocess.run(cmd, check=True)
     except (subprocess.CalledProcessError, FileNotFoundError) as e:
         logger.error(f"Command failed: {e}")
         sys.exit(1)
@@ -59,8 +55,7 @@ def cmd_up(args):
         run_docker_cli_command(
             'run',
             (['-d'] if args.detach else []) + ['--name', container_name, image] + (['--'] + shlex.split(command) if command else []),
-            cache_dir=args.cache_dir,
-            detach=args.detach
+            cache_dir=args.cache_dir
         )
         time.sleep(1) # Add a short delay to avoid race conditions
 
@@ -102,6 +97,9 @@ def main():
 
     down_parser = subparsers.add_parser('down', help='Stop and remove containers')
     down_parser.set_defaults(func=cmd_down)
+
+    version_parser = subparsers.add_parser('version', help='Show compose version')
+    version_parser.set_defaults(func=lambda _args: print("android-docker-compose 1.0"))
 
     args = parser.parse_args()
     args.func(args)

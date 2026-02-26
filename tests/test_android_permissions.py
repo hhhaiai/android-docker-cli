@@ -196,6 +196,24 @@ class TestAndroidHostsBind(unittest.TestCase):
         finally:
             self.runner._is_android_environment = original_method
 
+    def test_android_hosts_file_appends_add_host_entries(self):
+        rootfs_dir = os.path.join(self.test_dir, 'rootfs')
+        os.makedirs(rootfs_dir, exist_ok=True)
+
+        original_method = self.runner._is_android_environment
+        self.runner._is_android_environment = lambda: True
+        try:
+            bind_spec = self.runner._prepare_android_hosts_bind(
+                rootfs_dir,
+                extra_hosts=['foo.local:127.0.0.1', 'bad_entry']
+            )
+            self.assertIsNotNone(bind_spec)
+            host_hosts_path = bind_spec.rsplit(':', 1)[0]
+            content = Path(host_hosts_path).read_text(encoding='utf-8')
+            self.assertIn('127.0.0.1 foo.local', content)
+        finally:
+            self.runner._is_android_environment = original_method
+
 
 class TestAndroidResolvBind(unittest.TestCase):
     """测试Android resolv.conf绑定"""
@@ -246,6 +264,18 @@ class TestAndroidResolvBind(unittest.TestCase):
         cmd = self.runner._build_proot_command(Args())
         self.assertNotIn('/system/etc/resolv.conf:/etc/resolv.conf', cmd)
         self.assertTrue(any(item.endswith(':/etc/resolv.conf') for item in cmd))
+
+    def test_resolv_bind_prefers_explicit_dns_servers(self):
+        bind_spec = self.runner._prepare_android_resolv_bind(
+            self.rootfs_dir,
+            dns_servers=['8.8.8.8', '1.1.1.1'],
+        )
+        expected_path = os.path.join(self.test_dir, 'writable_dirs', 'etc_resolv.conf')
+        self.assertEqual(bind_spec, f"{expected_path}:/etc/resolv.conf")
+
+        content = Path(expected_path).read_text(encoding='utf-8')
+        self.assertIn('nameserver 8.8.8.8', content)
+        self.assertIn('nameserver 1.1.1.1', content)
 
 
 class TestAndroidFakeRootMode(unittest.TestCase):

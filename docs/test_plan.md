@@ -139,3 +139,9 @@
     1.  命令成功执行。
     2.  日志显示正在停止和移除 `compose-test-app` 和 `compose-test-db` 容器。
     3.  执行 `python docker_cli.py ps -a`，不再显示这两个容器。
+
+## 6. 参数组合兼容归档
+
+已归档一份“用户从原生 Docker 直接拷贝参数”场景清单，用于项目修复优先级和使用侧避坑参考：
+
+- `docs/docker-parameter-compat-matrix-2026-02-26.md`

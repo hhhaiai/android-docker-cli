@@ -13,8 +13,9 @@ import logging
 import time
 import subprocess
 import signal
+import re
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 import getpass
 from urllib.parse import urlparse
 
@@ -25,6 +26,103 @@ from .create_rootfs_tar import DockerImageToRootFS
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+UNSUPPORTED_RUN_OPTIONS = ['-p', '--publish', '--network', '--restart', '--privileged']
+
+
+class UnsupportedRunOption(argparse.Action):
+    """Argparse action that emits an explicit unsupported error."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        parser.error(
+            f"参数 {option_string} 在当前 proot 模式不支持。"
+            " 请移除该参数，或改用当前支持的参数组合。"
+        )
+
+
+def parse_image_reference(image_url):
+    """Split image url into repository and tag."""
+    if not image_url:
+        return "unknown", "latest"
+    last_slash = image_url.rfind("/")
+    last_colon = image_url.rfind(":")
+    if last_colon > last_slash:
+        return image_url[:last_colon], image_url[last_colon + 1:]
+    return image_url, "latest"
+
+
+def parse_tail_value(tail_value):
+    """Parse docker logs --tail value."""
+    if tail_value in (None, "all"):
+        return None
+    try:
+        value = int(tail_value)
+        return max(value, 0)
+    except ValueError:
+        raise ValueError("--tail 必须是整数或 all")
+
+
+def parse_since_value(since_value):
+    """Parse docker logs --since value to epoch seconds."""
+    if not since_value:
+        return None
+
+    duration_match = re.match(r"^(\d+)([smhd])$", since_value.strip())
+    if duration_match:
+        amount = int(duration_match.group(1))
+        unit = duration_match.group(2)
+        seconds = {
+            "s": amount,
+            "m": amount * 60,
+            "h": amount * 3600,
+            "d": amount * 86400,
+        }[unit]
+        return time.time() - seconds
+
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+        try:
+            dt = datetime.strptime(since_value, fmt)
+            return dt.timestamp()
+        except ValueError:
+            continue
+
+    raise ValueError("--since 仅支持 Ns/Nm/Nh/Nd 或 'YYYY-MM-DD HH:MM:SS'")
+
+
+def log_line_timestamp(line):
+    """Extract epoch timestamp from default logger line prefix."""
+    match = re.match(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", line)
+    if not match:
+        return None
+    try:
+        return datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S").timestamp()
+    except ValueError:
+        return None
+
+
+def apply_go_template(format_str, mapping):
+    """Apply a tiny subset of Docker go-template placeholders."""
+    result = format_str
+    for key, value in mapping.items():
+        result = result.replace(f"{{{{.{key}}}}}", str(value))
+    return result
+
+
+def load_env_file_entries(env_files):
+    """Load KEY=VALUE pairs from env-file paths."""
+    env_pairs = []
+    for env_file in env_files or []:
+        if not os.path.exists(env_file):
+            raise ValueError(f"env-file 不存在: {env_file}")
+        with open(env_file, "r", encoding="utf-8", errors="ignore") as handle:
+            for lineno, raw in enumerate(handle, start=1):
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    raise ValueError(f"env-file 格式错误 {env_file}:{lineno}")
+                env_pairs.append(line)
+    return env_pairs
 
 class DockerCLI:
     """Docker风格的命令行接口"""
@@ -215,6 +313,11 @@ class DockerCLI:
                 self.command = command
                 # Internal: used to persist/reuse the effective Android fake-root setting for detached containers.
                 self.fake_root = kwargs.get('fake_root', None)
+                self.user = kwargs.get('user')
+                self.entrypoint = kwargs.get('entrypoint')
+                self.add_host = kwargs.get('add_host', [])
+                self.dns = kwargs.get('dns', [])
+                self.rm = kwargs.get('auto_remove', False)
                 if self.command and self.command[0] == '--':
                     self.command = self.command[1:]
                 
@@ -241,11 +344,18 @@ class DockerCLI:
             'pid': None,
             'container_dir': container_dir, 
             'detached': args.detach,
+            'auto_remove': args.rm,
             'run_args': { # Store all arguments needed to restart
                 'env': args.env,
                 'bind': args.bind,
                 'workdir': args.workdir,
+                'interactive': args.interactive,
                 'fake_root': args.fake_root,
+                'user': args.user,
+                'entrypoint': args.entrypoint,
+                'add_host': args.add_host,
+                'dns': args.dns,
+                'auto_remove': args.rm,
             }
         }
         
@@ -329,10 +439,18 @@ class DockerCLI:
             cmd.extend(['--workdir', args.workdir])
         if args.interactive:
             cmd.append('--interactive')
+        if getattr(args, 'user', None):
+            cmd.extend(['--user', args.user])
+        if getattr(args, 'entrypoint', None):
+            cmd.extend(['--entrypoint', args.entrypoint])
         for e in args.env:
             cmd.extend(['-e', e])
         for b in args.bind:
             cmd.extend(['-b', b])
+        for host_entry in getattr(args, 'add_host', []):
+            cmd.extend(['--add-host', host_entry])
+        for dns_entry in getattr(args, 'dns', []):
+            cmd.extend(['--dns', dns_entry])
         
         # 添加镜像URL和命令
         # 添加 -- 分隔符来区分 proot_runner.py 的参数和容器的命令
@@ -412,6 +530,8 @@ class DockerCLI:
                                 os.remove(file_path)
                                 logger.debug(f"已删除陈旧的PID文件: {file_path}")
                                 cleaned_files += 1
+                            except PermissionError as e:
+                                logger.debug(f"无权限删除PID文件 {file_path}: {e}")
                             except OSError as e:
                                 logger.warning(f"删除PID文件失败 {file_path}: {e}")
                 except Exception as e:
@@ -496,6 +616,11 @@ class DockerCLI:
                 self.interactive = run_args.get('interactive', False)
                 self.force_download = False
                 self.fake_root = run_args.get('fake_root', None)
+                self.user = run_args.get('user')
+                self.entrypoint = run_args.get('entrypoint')
+                self.add_host = run_args.get('add_host', [])
+                self.dns = run_args.get('dns', [])
+                self.rm = run_args.get('auto_remove', False)
 
         args = Args()
 
@@ -557,7 +682,7 @@ class DockerCLI:
 
         return start_success
 
-    def logs(self, container_id, follow=False):
+    def logs(self, container_id, follow=False, tail='all', since=None):
         """显示容器的日志"""
         containers = self._load_containers()
         if container_id not in containers:
@@ -576,15 +701,36 @@ class DockerCLI:
             return True
 
         try:
+            tail_limit = parse_tail_value(tail)
+            since_epoch = parse_since_value(since)
             with open(log_file, 'r') as f:
                 if not follow:
-                    # Print existing content and exit
-                    print(f.read(), end='')
+                    lines = f.readlines()
+                    if since_epoch is not None:
+                        filtered = []
+                        for line in lines:
+                            ts = log_line_timestamp(line)
+                            if ts is None or ts >= since_epoch:
+                                filtered.append(line)
+                        lines = filtered
+                    if tail_limit is not None:
+                        lines = lines[-tail_limit:]
+                    print(''.join(lines), end='')
                     return True
                 else:
                     # Follow mode (like tail -f)
                     # Print existing content first
-                    print(f.read(), end='')
+                    lines = f.readlines()
+                    if since_epoch is not None:
+                        filtered = []
+                        for line in lines:
+                            ts = log_line_timestamp(line)
+                            if ts is None or ts >= since_epoch:
+                                filtered.append(line)
+                        lines = filtered
+                    if tail_limit is not None:
+                        lines = lines[-tail_limit:]
+                    print(''.join(lines), end='')
                     # Then wait for new content
                     while True:
                         line = f.readline()
@@ -592,6 +738,9 @@ class DockerCLI:
                             time.sleep(0.1)
                             continue
                         print(line, end='')
+        except ValueError as e:
+            logger.error(str(e))
+            return False
         except KeyboardInterrupt:
             print() # Print a newline after Ctrl+C
             return True
@@ -606,7 +755,7 @@ class DockerCLI:
         # Attach is implemented by executing an interactive shell in the container.
         return self.exec(container_id, [], interactive=True)
 
-    def exec(self, container_id, command, interactive=False):
+    def exec(self, container_id, command, interactive=False, env=None, user=None):
         """在运行中的容器中执行命令"""
         containers = self._load_containers()
         if container_id not in containers:
@@ -691,20 +840,23 @@ class DockerCLI:
         logger.info(f"在容器 {container_id} 中执行命令: {' '.join(command)}")
         
         try:
+            child_env = os.environ.copy()
+            child_env.pop('LD_PRELOAD', None)
+            for env_entry in env or []:
+                if '=' not in env_entry:
+                    logger.error(f"无效环境变量格式: {env_entry}")
+                    return False
+                key, value = env_entry.split('=', 1)
+                child_env[key] = value
+            if user and user not in ('0', '0:0', 'root'):
+                logger.warning(f"--user={user} 当前在proot模式仅部分支持，继续以当前用户执行。")
+
             if interactive:
                 # Interactive mode: connect stdin/stdout/stderr
-                env = os.environ.copy()
-                # Remove LD_PRELOAD for Android Termux compatibility
-                if 'LD_PRELOAD' in env:
-                    del env['LD_PRELOAD']
-                subprocess.run(proot_cmd, env=env)
+                subprocess.run(proot_cmd, env=child_env)
             else:
                 # Non-interactive mode: capture output
-                env = os.environ.copy()
-                # Remove LD_PRELOAD for Android Termux compatibility
-                if 'LD_PRELOAD' in env:
-                    del env['LD_PRELOAD']
-                result = subprocess.run(proot_cmd, env=env, capture_output=True, text=True)
+                result = subprocess.run(proot_cmd, env=child_env, capture_output=True, text=True)
                 if result.stdout:
                     print(result.stdout, end='')
                 if result.stderr:
@@ -715,7 +867,7 @@ class DockerCLI:
             logger.error(f"执行命令失败: {e}")
             return False
 
-    def ps(self, all_containers=False):
+    def ps(self, all_containers=False, quiet=False, format_str=None):
         """列出容器"""
         containers = self._load_containers()
         
@@ -724,20 +876,33 @@ class DockerCLI:
             return
             
         # 更新运行中容器的状态
+        auto_remove_ids = []
         for container_id, info in containers.items():
             if info.get('status') == 'running' and info.get('pid'):
                 # 对于通过新方法启动的容器，pid是proot进程的真实pid
                 if not self._is_process_running(info['pid']):
                     self._mark_container_exited(info)
+                    if info.get('auto_remove'):
+                        auto_remove_ids.append(container_id)
             elif info.get('status') == 'running' and not info.get('pid'):
                 # 进程ID缺失通常意味着上次前台运行被异常终止，避免僵尸“running”状态
                 self._mark_container_exited(info)
+                if info.get('auto_remove'):
+                    auto_remove_ids.append(container_id)
             elif info.get('status') == 'running' and info.get('script_path'):
                  # 兼容旧的、通过wrapper script启动的容器
                 if not self._is_process_running(info['pid']):
                     self._mark_container_exited(info)
+                    if info.get('auto_remove'):
+                        auto_remove_ids.append(container_id)
 
-        
+        for container_id in auto_remove_ids:
+            info = containers.get(container_id)
+            if not info:
+                continue
+            self._cleanup_container_storage(info)
+            del containers[container_id]
+
         self._save_containers(containers)
         
         # 过滤容器
@@ -748,23 +913,103 @@ class DockerCLI:
         if not containers:
             logger.info("没有运行中的容器")
             return
+
+        rows = []
+        for container_id, info in containers.items():
+            image = info.get('image', 'unknown')
+            command = ' '.join(info.get('command', [])) or 'default'
+            created = info.get('created_str', 'unknown')
+            status = info.get('status', 'unknown')
+            rows.append({
+                "ID": container_id,
+                "Image": image,
+                "Command": command,
+                "CreatedAt": created,
+                "Status": status,
+                "Names": container_id,
+            })
+
+        if quiet:
+            for row in rows:
+                print(row["ID"])
+            return
+
+        if format_str:
+            for row in rows:
+                print(apply_go_template(format_str, row))
+            return
             
         # 显示容器列表
         print(f"{'CONTAINER ID':<12} {'IMAGE':<30} {'COMMAND':<20} {'CREATED':<20} {'STATUS':<10}")
         print("-" * 100)
         
-        for container_id, info in containers.items():
-            image = info.get('image', 'unknown')[:28]
-            command = ' '.join(info.get('command', []))[:18] or 'default'
-            created = info.get('created_str', 'unknown')
-            status = info.get('status', 'unknown')
+        for row in rows:
+            image = row["Image"][:28]
+            command = row["Command"][:18]
+            print(f"{row['ID']:<12} {image:<30} {command:<20} {row['CreatedAt']:<20} {row['Status']:<10}")
             
-            print(f"{container_id:<12} {image:<30} {command:<20} {created:<20} {status:<10}")
-            
-    def images(self):
+    def _collect_cached_images(self):
+        """Read cached image entries from cache dir."""
+        entries = []
+        if not os.path.isdir(self.cache_dir):
+            return entries
+
+        for filename in os.listdir(self.cache_dir):
+            if not filename.endswith('.tar.gz'):
+                continue
+            cache_path = os.path.join(self.cache_dir, filename)
+            info_path = cache_path + '.info'
+
+            image_url = 'unknown:latest'
+            created = 'unknown'
+            if os.path.exists(info_path):
+                try:
+                    with open(info_path, 'r', encoding='utf-8') as f:
+                        info = json.load(f)
+                    image_url = info.get('image_url', image_url)
+                    created = info.get('created_time_str', created)
+                except Exception:
+                    pass
+
+            repository, tag = parse_image_reference(image_url)
+            image_id = filename[:-7].rsplit('_', 1)[-1] if '_' in filename[:-7] else filename[:-7]
+            size_mb = os.path.getsize(cache_path) / 1024 / 1024
+            entries.append({
+                "Repository": repository,
+                "Tag": tag,
+                "Reference": f"{repository}:{tag}",
+                "ID": image_id[:12],
+                "Digest": f"sha256:{image_id}",
+                "CreatedAt": created,
+                "Size": f"{size_mb:.2f}MB",
+            })
+        return entries
+
+    def images(self, digests=False, format_str=None):
         """列出镜像"""
-        logger.info("列出缓存的镜像:")
-        self.runner.list_cache()
+        if not digests and not format_str:
+            logger.info("列出缓存的镜像:")
+            self.runner.list_cache()
+            return
+
+        entries = self._collect_cached_images()
+        if not entries:
+            logger.info("没有缓存的镜像")
+            return
+
+        if format_str:
+            for entry in entries:
+                print(apply_go_template(format_str, entry))
+            return
+
+        if digests:
+            print(f"{'REPOSITORY':<42} {'TAG':<12} {'DIGEST':<22} {'IMAGE ID':<14} {'SIZE':<10}")
+            for entry in entries:
+                digest_short = entry["Digest"][:20]
+                print(
+                    f"{entry['Repository'][:40]:<42} {entry['Tag'][:10]:<12} "
+                    f"{digest_short:<22} {entry['ID']:<14} {entry['Size']:<10}"
+                )
     
     def load(self, tar_path):
         """从tar归档文件加载镜像"""
@@ -797,8 +1042,38 @@ class DockerCLI:
         except Exception as e:
             logger.error(f"删除镜像失败: {e}")
             return False
+
+    def _cleanup_container_storage(self, container_info):
+        """Best-effort cleanup for container directories and legacy artifacts."""
+        container_dir = container_info.get('container_dir')
+        if container_dir and os.path.isdir(container_dir):
+            try:
+                import shutil
+                shutil.rmtree(container_dir)
+                logger.debug(f"已清理容器目录: {container_dir}")
+                writable_dirs_path = os.path.join(os.path.dirname(container_dir), 'writable_dirs')
+                if os.path.isdir(writable_dirs_path):
+                    shutil.rmtree(writable_dirs_path)
+                    logger.debug(f"已清理可写目录: {writable_dirs_path}")
+            except OSError as e:
+                logger.warning(f"清理容器目录失败 {container_dir}: {e}")
+
+        rootfs_dir = container_info.get('rootfs_dir')
+        if rootfs_dir and os.path.isdir(rootfs_dir):
+            try:
+                import shutil
+                shutil.rmtree(rootfs_dir)
+            except OSError:
+                pass
+
+        script_path = container_info.get('script_path')
+        if script_path and os.path.exists(script_path):
+            try:
+                os.remove(script_path)
+            except OSError:
+                pass
         
-    def stop(self, container_id):
+    def stop(self, container_id, timeout=2):
         """停止容器"""
         containers = self._load_containers()
         
@@ -815,6 +1090,8 @@ class DockerCLI:
             container_info['finished'] = time.time()
             container_info['finished_str'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             self._save_containers(containers)
+            if container_info.get('auto_remove'):
+                return self.rm(container_id, force=True)
             return True
 
         # 如果没有PID，或者PID对应的进程没有运行，并且容器状态不是运行中，则直接认为已停止
@@ -827,6 +1104,8 @@ class DockerCLI:
                     container_info['finished'] = time.time()
                     container_info['finished_str'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                     self._save_containers(containers)
+                if container_info.get('auto_remove'):
+                    return self.rm(container_id, force=True)
                 return True
             else:
                 logger.warning(f"容器 {container_id} 没有有效的PID信息或进程未运行，但状态为 {container_info.get('status')}. 尝试强制停止.")
@@ -838,6 +1117,8 @@ class DockerCLI:
                 container_info['finished'] = time.time()
                 container_info['finished_str'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 self._save_containers(containers)
+                if container_info.get('auto_remove'):
+                    return self.rm(container_id, force=True)
                 return True
             
         try:
@@ -845,8 +1126,9 @@ class DockerCLI:
             os.killpg(pid, signal.SIGTERM)
             logger.info(f"已发送停止信号给容器进程组 {container_id} (PGID: {pid})")
             
-            # 等待一段时间后检查是否停止
-            time.sleep(2)
+            wait_seconds = max(int(timeout or 0), 0)
+            if wait_seconds > 0:
+                time.sleep(wait_seconds)
             if not self._is_process_running(pid):
                 container_info['status'] = 'exited'
                 container_info['finished'] = time.time()
@@ -854,6 +1136,8 @@ class DockerCLI:
                 containers[container_id] = container_info
                 self._save_containers(containers)
                 logger.info(f"容器 {container_id} 已停止")
+                if container_info.get('auto_remove'):
+                    return self.rm(container_id, force=True)
                 return True
             else:
                 logger.warning(f"容器 {container_id} 未响应SIGTERM，尝试SIGKILL")
@@ -861,14 +1145,19 @@ class DockerCLI:
                 container_info['status'] = 'killed'
                 containers[container_id] = container_info
                 self._save_containers(containers)
+                if container_info.get('auto_remove'):
+                    return self.rm(container_id, force=True)
                 return True
                 
         except (OSError, ProcessLookupError) as e:
             logger.error(f"停止容器失败: {e}")
             return False
             
-    def rm(self, container_id, force=False):
+    def rm(self, container_id, force=False, volumes=False):
         """删除容器"""
+        if volumes:
+            logger.info("当前实现不区分 volume 生命周期，-v 参数已忽略。")
+
         containers = self._load_containers()
         
         if container_id not in containers:
@@ -899,36 +1188,7 @@ class DockerCLI:
                     return True
                 
         # 清理容器的持久化目录
-        container_dir = container_info.get('container_dir')
-        if container_dir and os.path.isdir(container_dir):
-            try:
-                import shutil
-                shutil.rmtree(container_dir)
-                logger.debug(f"已清理容器目录: {container_dir}")
-                
-                # 清理writable_dirs（如果存在）
-                writable_dirs_path = os.path.join(os.path.dirname(container_dir), 'writable_dirs')
-                if os.path.isdir(writable_dirs_path):
-                    shutil.rmtree(writable_dirs_path)
-                    logger.debug(f"已清理可写目录: {writable_dirs_path}")
-            except OSError as e:
-                logger.warning(f"清理容器目录失败 {container_dir}: {e}")
-
-        # 兼容旧的清理逻辑
-        rootfs_dir = container_info.get('rootfs_dir')
-        if rootfs_dir and os.path.isdir(rootfs_dir):
-            try:
-                import shutil
-                shutil.rmtree(rootfs_dir)
-            except OSError:
-                pass
-
-        script_path = container_info.get('script_path')
-        if script_path and os.path.exists(script_path):
-            try:
-                os.remove(script_path)
-            except OSError:
-                pass
+        self._cleanup_container_storage(container_info)
                 
         # 删除容器记录
         if container_id in containers:
@@ -1005,6 +1265,7 @@ def create_parser():
     pull_parser = subparsers.add_parser('pull', help='拉取镜像')
     pull_parser.add_argument('image', help='镜像URL')
     pull_parser.add_argument('--force', action='store_true', help='强制重新下载')
+    pull_parser.add_argument('--platform', help='目标平台（当前仅接受并提示，不改变实际拉取架构）')
 
     # run 命令
     run_parser = subparsers.add_parser('run', help='运行容器')
@@ -1015,8 +1276,18 @@ def create_parser():
     run_parser.add_argument('-it', '--interactive-tty', action='store_true', help='交互式运行容器 (分配伪TTY并保持stdin打开)')
     run_parser.add_argument('-e', '--env', action='append', default=[], help='环境变量 (KEY=VALUE)')
     run_parser.add_argument('-v', '--volume', dest='bind', action='append', default=[], help='挂载卷 (HOST:CONTAINER)')
+    run_parser.add_argument('--env-file', action='append', default=[], help='从文件加载环境变量')
     run_parser.add_argument('-w', '--workdir', help='工作目录')
+    run_parser.add_argument('--entrypoint', help='覆盖镜像入口点')
+    run_parser.add_argument('--user', help='运行用户（当前为部分支持）')
+    run_parser.add_argument('--add-host', action='append', default=[], help='额外hosts映射 HOST:IP')
+    run_parser.add_argument('--dns', action='append', default=[], help='额外DNS服务器')
+    run_parser.add_argument('--rm', action='store_true', help='容器退出后自动删除（后台容器将在状态刷新时清理）')
     run_parser.add_argument('--force-download', action='store_true', help='强制重新下载镜像')
+    run_parser.add_argument('-p', '--publish', nargs=1, action=UnsupportedRunOption, help=argparse.SUPPRESS)
+    run_parser.add_argument('--network', nargs=1, action=UnsupportedRunOption, help=argparse.SUPPRESS)
+    run_parser.add_argument('--restart', nargs=1, action=UnsupportedRunOption, help=argparse.SUPPRESS)
+    run_parser.add_argument('--privileged', nargs=0, action=UnsupportedRunOption, help=argparse.SUPPRESS)
 
     # start 命令
     start_parser = subparsers.add_parser('start', help='启动一个已停止的容器')
@@ -1029,14 +1300,20 @@ def create_parser():
     # ps 命令
     ps_parser = subparsers.add_parser('ps', help='列出容器')
     ps_parser.add_argument('-a', '--all', action='store_true', help='显示所有容器（包括已停止的）')
+    ps_parser.add_argument('-q', '--quiet', action='store_true', help='仅显示容器ID')
+    ps_parser.add_argument('--format', help='自定义输出模板，例如: {{.ID}} {{.Status}}')
 
     # logs 命令
     logs_parser = subparsers.add_parser('logs', help='查看容器日志')
     logs_parser.add_argument('container', help='容器ID')
     logs_parser.add_argument('-f', '--follow', action='store_true', help='持续输出日志')
+    logs_parser.add_argument('--tail', default='all', help='仅显示末尾N行（默认all）')
+    logs_parser.add_argument('--since', help='仅显示某时间点之后日志（例如 10m）')
 
     # images 命令
-    subparsers.add_parser('images', help='列出镜像')
+    images_parser = subparsers.add_parser('images', help='列出镜像')
+    images_parser.add_argument('--digests', action='store_true', help='显示摘要')
+    images_parser.add_argument('--format', help='自定义输出模板，例如: {{.Repository}}:{{.Tag}}')
 
     # rmi 命令
     rmi_parser = subparsers.add_parser('rmi', help='删除镜像')
@@ -1045,11 +1322,13 @@ def create_parser():
     # stop 命令
     stop_parser = subparsers.add_parser('stop', help='停止容器')
     stop_parser.add_argument('container', help='容器ID')
+    stop_parser.add_argument('-t', '--time', type=int, default=2, help='停止前等待秒数')
 
     # rm 命令
     rm_parser = subparsers.add_parser('rm', help='删除容器')
-    rm_parser.add_argument('container', help='容器ID')
+    rm_parser.add_argument('container', nargs='+', help='容器ID')
     rm_parser.add_argument('-f', '--force', action='store_true', help='强制删除运行中的容器')
+    rm_parser.add_argument('-v', '--volumes', action='store_true', help='删除关联卷（当前为兼容参数）')
     
     # attach 命令
     attach_parser = subparsers.add_parser('attach', help='附加到运行中的容器并查看输出')
@@ -1060,15 +1339,35 @@ def create_parser():
     exec_parser.add_argument('container', help='容器ID')
     exec_parser.add_argument('command', nargs='*', help='要执行的命令')
     exec_parser.add_argument('-it', '--interactive-tty', action='store_true', help='交互式运行容器 (分配伪TTY并保持stdin打开)')
+    exec_parser.add_argument('-e', '--env', action='append', default=[], help='环境变量 (KEY=VALUE)')
+    exec_parser.add_argument('--user', help='执行用户（当前为部分支持）')
 
     # load 命令
     load_parser = subparsers.add_parser('load', help='从tar归档文件加载镜像')
     load_parser.add_argument('-i', '--input', required=True, help='输入tar文件路径')
 
+    # compose 子命令
+    compose_parser = subparsers.add_parser('compose', help='Compose 子命令（兼容 docker compose）')
+    compose_parser.add_argument('compose_args', nargs=argparse.REMAINDER, help='compose 参数')
+
     return parser
 
 def main():
     """主函数"""
+    # Fast path for `docker compose ...` so compose flags (e.g. `-f`) are passed through intact.
+    raw_argv = sys.argv[1:]
+    global_parser = argparse.ArgumentParser(add_help=False)
+    global_parser.add_argument('--cache-dir')
+    global_parser.add_argument('--verbose', action='store_true')
+    global_args, remainder = global_parser.parse_known_args(raw_argv)
+    if remainder and remainder[0] == 'compose':
+        compose_cmd = [sys.executable, '-m', 'android_docker.docker_compose_cli']
+        if global_args.cache_dir:
+            compose_cmd.extend(['--cache-dir', global_args.cache_dir])
+        compose_cmd.extend(remainder[1:])
+        result = subprocess.run(compose_cmd)
+        sys.exit(result.returncode)
+
     parser = create_parser()
     args, unknown = parser.parse_known_args()
 
@@ -1078,6 +1377,11 @@ def main():
         # `args.command` will have any command parts found before an unknown option.
         # `unknown` will have any arguments that were not recognized.
         # For `run` and `exec`, these are part of the command to be executed.
+        if unknown and '--' not in sys.argv[1:] and any(item.startswith('--') for item in unknown):
+            parser.error(
+                f"检测到未识别参数: {' '.join(unknown)}。"
+                "如需把该参数传给容器内命令，请在镜像后添加 '--' 分隔符。"
+            )
         args.command.extend(unknown)
     elif unknown:
         # For other subcommands, unknown arguments are an error.
@@ -1100,10 +1404,21 @@ def main():
             sys.exit(0 if success else 1)
 
         elif args.subcommand == 'pull':
+            if args.platform:
+                logger.warning(f"当前实现忽略 --platform={args.platform}，将按宿主架构拉取。")
             success = cli.pull(args.image, force=args.force)
             sys.exit(0 if success else 1)
 
         elif args.subcommand == 'run':
+            if args.entrypoint and not args.entrypoint.strip():
+                parser.error("--entrypoint 不能为空")
+
+            env_entries = list(args.env)
+            try:
+                env_entries.extend(load_env_file_entries(args.env_file))
+            except ValueError as e:
+                parser.error(str(e))
+
             # 在调用run之前加载凭证并附加到kwargs
             config = cli._load_config()
             auths = config.get('auths', {})
@@ -1119,14 +1434,19 @@ def main():
                 args.image,
                 command=args.command,
                 name=args.name,
-                env=args.env,
+                env=env_entries,
                 bind=args.bind,
                 workdir=args.workdir,
                 detach=args.detach,
                 interactive=args.interactive_tty,
                 force_download=args.force_download,
                 username=username,
-                password=password
+                password=password,
+                auto_remove=args.rm,
+                user=args.user,
+                entrypoint=args.entrypoint,
+                add_host=args.add_host,
+                dns=args.dns,
             )
             sys.exit(0 if container_id else 1)
 
@@ -1139,38 +1459,60 @@ def main():
             sys.exit(0 if success else 1)
 
         elif args.subcommand == 'ps':
-            cli.ps(all_containers=args.all)
+            cli.ps(all_containers=args.all, quiet=args.quiet, format_str=args.format)
 
         elif args.subcommand == 'logs':
-            success = cli.logs(args.container, follow=args.follow)
+            success = cli.logs(
+                args.container,
+                follow=args.follow,
+                tail=args.tail,
+                since=args.since,
+            )
             sys.exit(0 if success else 1)
 
         elif args.subcommand == 'images':
-            cli.images()
+            cli.images(digests=args.digests, format_str=args.format)
 
         elif args.subcommand == 'rmi':
             success = cli.rmi(args.image)
             sys.exit(0 if success else 1)
 
         elif args.subcommand == 'stop':
-            success = cli.stop(args.container)
+            success = cli.stop(args.container, timeout=args.time)
             sys.exit(0 if success else 1)
 
         elif args.subcommand == 'rm':
-            success = cli.rm(args.container, force=args.force)
-            sys.exit(0 if success else 1)
+            all_success = True
+            for container_id in args.container:
+                success = cli.rm(container_id, force=args.force, volumes=args.volumes)
+                all_success = all_success and success
+            sys.exit(0 if all_success else 1)
             
         elif args.subcommand == 'attach':
             success = cli.attach(args.container)
             sys.exit(0 if success else 1)
             
         elif args.subcommand == 'exec':
-            success = cli.exec(args.container, args.command, interactive=args.interactive_tty)
+            success = cli.exec(
+                args.container,
+                args.command,
+                interactive=args.interactive_tty,
+                env=args.env,
+                user=args.user,
+            )
             sys.exit(0 if success else 1)
 
         elif args.subcommand == 'load':
             success = cli.load(args.input)
             sys.exit(0 if success else 1)
+
+        elif args.subcommand == 'compose':
+            compose_cmd = [sys.executable, '-m', 'android_docker.docker_compose_cli']
+            if args.cache_dir:
+                compose_cmd.extend(['--cache-dir', args.cache_dir])
+            compose_cmd.extend(args.compose_args or [])
+            result = subprocess.run(compose_cmd)
+            sys.exit(result.returncode)
 
         else:
             logger.error(f"未知命令: {args.subcommand}")

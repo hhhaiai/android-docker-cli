@@ -19,11 +19,11 @@ You can install this tool with a single command:
 # Install latest version (main branch)
 curl -sSL https://raw.githubusercontent.com/jinhan1414/android-docker-cli/main/scripts/install.sh | sh
 
-# Install specific version (e.g., v1.1.0)
-curl -sSL https://raw.githubusercontent.com/jinhan1414/android-docker-cli/v1.1.0/scripts/install.sh | sh
+# Install specific version (e.g., v1.2.15)
+curl -sSL https://raw.githubusercontent.com/jinhan1414/android-docker-cli/v1.2.15/scripts/install.sh | sh
 
 # Or use environment variable to specify version
-INSTALL_VERSION=v1.2.0 curl -sSL https://raw.githubusercontent.com/jinhan1414/android-docker-cli/main/scripts/install.sh | sh
+INSTALL_VERSION=v1.2.15 curl -sSL https://raw.githubusercontent.com/jinhan1414/android-docker-cli/main/scripts/install.sh | sh
 ```
 
 This will create an executable `docker` command in your path. After installation, you can run the tool by simply typing `docker`.
@@ -66,6 +66,12 @@ docker run -it swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/library/alpine
 # This example uses the `examples/nginx.conf` file, which listens on port 8777.
 docker run -d --name my-nginx -v $(pwd)/examples/nginx.conf:/etc/nginx/nginx.conf nginx:alpine
 
+# Auto-remove container after exit
+docker run --rm alpine:latest sh -c "echo done"
+
+# Use env file / entrypoint / user
+docker run --env-file .env --entrypoint /bin/sh --user 0 alpine:latest -c "env | head"
+
 # List running containers
 docker ps
 
@@ -75,9 +81,12 @@ docker ps -a
 # View container logs
 docker logs <container_id>
 docker logs -f <container_id>  # Follow logs
+docker logs --tail 20 <container_id>
+docker logs --since 1m <container_id>
 
 # Stop a container
 docker stop <container_id>
+docker stop -t 1 <container_id>
 
 # Start a stopped container
 docker start <container_id>
@@ -87,6 +96,7 @@ docker restart <container_id>
 
 # Remove a container
 docker rm <container_id>
+docker rm -f -v <container_id_1> <container_id_2>
 
 # Attach to a running container
 docker attach <container_id>
@@ -94,9 +104,12 @@ docker attach <container_id>
 # Execute a command in a running container
 docker exec <container_id> ls -l
 docker exec -it <container_id> /bin/sh
+docker exec -e A=1 --user 0 <container_id> sh -c "echo \$A"
 
 # List cached images
 docker images
+docker images --digests
+docker images --format "{{.Repository}}:{{.Tag}} {{.Digest}}"
 
 # Load an image from a local tar file
 docker load -i alpine.tar
@@ -151,17 +164,20 @@ docker load -i alpine.tar
 
 ## Docker Compose Support
 
-This tool includes a `docker-compose` command to manage multi-container applications.
+This tool supports both `docker compose` and `docker-compose` to manage multi-container applications.
 
 ```bash
 # Start services defined in docker-compose.yml
-docker-compose up
+docker compose up
 
 # Run in detached mode
-docker-compose up -d
+docker compose -f docker-compose.yml up -d
 
 # Stop and remove services
-docker-compose down
+docker compose down
+
+# Legacy command is still supported
+docker-compose up -d
 ```
 
 ### Sample `docker-compose.yml`
@@ -183,10 +199,36 @@ services:
 - ✅ **Registry Authentication**: `login` to private or public registries.
 - ✅ **Local Image Loading**: Load Docker images from local tar files with `docker load`.
 - ✅ **OCI Registry Support**: Pull images from OCI-compliant registries like GitHub Container Registry (ghcr.io).
-- ✅ **Docker Compose Support**: Manage multi-container setups with `docker-compose up` and `down`.
+- ✅ **Docker Compose Support**: Manage multi-container setups with both `docker compose` and `docker-compose`.
 - ✅ **Docker-Style CLI**: A familiar and intuitive command-line interface.
 - ✅ **Persistent Storage**: Containers maintain their state and filesystem across restarts, stored in `~/.docker_proot_cache/`.
 - ✅ **Android Optimized**: Specially optimized for the Termux environment.
+
+## Parameter Compatibility Notes (v1.2.15)
+
+Supported common combinations:
+- `docker run --rm`
+- `docker run --env-file`
+- `docker run --entrypoint`
+- `docker run --user` (partial support)
+- `docker run --add-host` and `docker run --dns` (Android path support)
+- `docker ps -q` and `docker ps --format`
+- `docker logs --tail` and `docker logs --since`
+- `docker exec -e` and `docker exec --user` (partial support)
+- `docker images --digests` and `docker images --format`
+- `docker pull --platform` (accepted with explicit "platform ignored" warning)
+- `docker stop -t`
+- `docker rm -v`
+- `docker rm` with multiple container arguments
+
+Explicitly unsupported `run` options (returns clear error):
+- `-p` and `--publish`
+- `--network`
+- `--restart`
+- `--privileged`
+
+Full archived compatibility matrix:
+- `docs/docker-parameter-compat-matrix-2026-02-26.md`
 
 ## Troubleshooting
 
